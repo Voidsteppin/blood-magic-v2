@@ -7,7 +7,7 @@ const { PRIVATE_KEY, ARBITRUM_SEPOLIA_RPC_URL } = process.env;
 module.exports = {
   solidity: {
     version: "0.8.24",
-    settings: { optimizer: { enabled: true, runs: 200 } },
+    settings: { optimizer: { enabled: true, runs: 200 }, viaIR: true },
   },
   networks: {
     arbitrumSepolia: {

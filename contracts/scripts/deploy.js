@@ -8,6 +8,8 @@ const CHAINLINK_ETH_USD = {
 };
 const ETH_USD = ethers.encodeBytes32String("ETH-USD");
 const SEED_LIQUIDITY = ethers.parseUnits("100000", 6);
+const VOTING_PERIOD = 60 * 60; // 1 hour, short so testnet votes are quick to try
+const QUORUM_BPS = 2_000; // 20% of members must vote
 
 async function main() {
   const [deployer] = await ethers.getSigners();
@@ -37,7 +39,13 @@ async function main() {
   await (await usdc.mint(deployer.address, SEED_LIQUIDITY)).wait();
   await (await usdc.approve(exchangeAddress, SEED_LIQUIDITY)).wait();
   await (await exchange.addLiquidity(SEED_LIQUIDITY)).wait();
-  console.log("Seeded pool with 100,000 test USDC");
+  console.log("Seeded the Collective with 100,000 test USDC");
+
+  const council = await ethers.deployContract("Council", [exchangeAddress, VOTING_PERIOD, QUORUM_BPS]);
+  await council.waitForDeployment();
+  const councilAddress = await council.getAddress();
+  await (await exchange.transferOwnership(councilAddress)).wait();
+  console.log("Council:", councilAddress, "(now owns the exchange)");
 
   if (network.name === "hardhat") {
     console.log("In-memory dry run: not writing web/src/deployments.json");
@@ -49,6 +57,7 @@ async function main() {
     network: network.name,
     usdc: await usdc.getAddress(),
     exchange: exchangeAddress,
+    council: councilAddress,
     markets: [{ id: "ETH-USD", feed: feedAddress }],
   };
   const file = path.join(__dirname, "..", "..", "web", "src", "deployments.json");

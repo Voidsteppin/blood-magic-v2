@@ -8,27 +8,50 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 
-/// @title PerpExchange
-/// @notice Minimal perpetual futures exchange. Traders post USDC margin and open leveraged
-/// long/short positions priced by Chainlink. A shared liquidity pool (LPs hold the PLP token)
-/// is the counterparty to every trade: it collects trading fees and trader losses, and pays
-/// trader profits.
+/// @title PerpExchange ("People's Perps")
+/// @notice A perpetual futures exchange run as a cooperative. Traders post USDC margin and open
+/// leveraged long/short positions priced by Chainlink. The Collective (LPs, holding
+/// non-transferable PLP membership shares) is the counterparty to every trade.
+///
+/// What makes it different from a normal perps DEX:
+/// - Progressive fees: marginal fee rates rise with a wallet's total position size, like tax brackets.
+/// - Whale cap: a maximum position size per wallet per market.
+/// - Fee split: part of every fee goes to the pool (pro rata to capital), part is split EQUALLY
+///   among members regardless of deposit size, and part funds a solidarity fund.
+/// - Solidarity fund: small traders who get liquidated receive part of their margin back.
+/// - Non-transferable shares: membership can be earned by depositing, never bought or sold.
+/// - Ownership is meant to be handed to the Council contract, so every parameter change is voted on.
 ///
 /// Accounting model: a position stores its notional `size` (USDC) and `units` (size / entry
-/// price, i.e. the amount of the asset it represents). PnL is linear:
-///   long  pnl = units * price - size
-///   short pnl = size - units * price
-/// Because this is linear, the exchange tracks per-market sums of size and units per side,
-/// which gives the exact aggregate unrealized PnL of all traders. LP shares are priced
-/// against pool balance minus that PnL, so LPs can't exit ahead of losses already incurred.
+/// price). PnL is linear (long: units*price - size, short: size - units*price), so per-market
+/// sums of size and units give the exact aggregate unrealized PnL of all traders. Pool shares
+/// are priced against pool balance minus that PnL, so members can't exit ahead of losses.
 contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint256 public constant PRICE_PRECISION = 1e18;
     uint256 public constant BPS = 10_000;
+    uint256 private constant ACC_PRECISION = 1e18;
     /// @dev Virtual shares/assets offset that neutralizes first-depositor share inflation.
     uint256 private constant VIRTUAL_SHARES = 1e12;
     uint256 private constant VIRTUAL_ASSETS = 1;
+
+    struct Params {
+        uint16[4] feeRatesBps; // marginal fee rate for each bracket
+        uint256[3] feeBrackets; // bracket upper bounds, USDC (6 decimals), strictly increasing
+        uint16 maintenanceMarginBps; // liquidatable when equity < this share of size
+        uint16 liquidatorRewardBps; // share of margin paid to the liquidator
+        uint16 maxUtilizationBps; // total open interest <= this share of pool value
+        uint16 maxProfitBps; // profit per position capped at this share of size
+        uint256 minMargin; // USDC
+        uint256 maxPriceAge; // seconds
+        uint256 maxPositionSize; // whale cap per wallet per market, USDC
+        uint16 dividendShareBps; // share of fees split equally among members
+        uint16 solidarityShareBps; // share of fees sent to the solidarity fund
+        uint16 solidarityRefundBps; // share of margin refunded to small liquidated traders
+        uint256 solidarityMarginCap; // positions with margin <= this qualify for a refund, USDC
+        uint256 minMemberDeposit; // pool value a wallet must hold to be a member, USDC
+    }
 
     struct Market {
         AggregatorV3Interface feed;
@@ -49,17 +72,19 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
     }
 
     IERC20 public immutable usdc;
+    Params internal _params;
 
-    /// @notice USDC owned by liquidity providers (excludes trader margin).
+    /// @notice USDC owned by the Collective's capital pool (excludes margin, dividends and the fund).
     uint256 public poolBalance;
+    /// @notice USDC set aside to refund small traders who get liquidated.
+    uint256 public solidarityFund;
+    /// @notice USDC owed to members as equal-share dividends but not yet claimed.
+    uint256 public dividendReserve;
 
-    uint256 public feeBps = 10; // 0.1% of size on open and on close
-    uint256 public maintenanceMarginBps = 100; // liquidatable when equity < 1% of size
-    uint256 public liquidatorRewardBps = 500; // liquidator receives 5% of the margin
-    uint256 public maxUtilizationBps = 5_000; // total open interest <= 50% of pool value
-    uint256 public maxProfitBps = 10_000; // profit per position capped at 100% of size
-    uint256 public minMargin = 10e6; // 10 USDC
-    uint256 public maxPriceAge = 1 days;
+    uint256 public memberCount;
+    uint256 public accDividendPerMember; // scaled by ACC_PRECISION
+    mapping(address => uint256) public memberSince; // 0 = not a member
+    mapping(address => uint256) internal _dividendDebt;
 
     bytes32[] public marketIds;
     mapping(bytes32 => Market) public markets;
@@ -73,9 +98,15 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         address indexed trader, bytes32 indexed marketId, bool isLong, uint256 sizeDelta, int256 pnl, uint256 price, uint256 fee, uint256 payout
     );
     event MarginAdded(address indexed trader, bytes32 indexed marketId, uint256 amount);
-    event Liquidated(address indexed trader, bytes32 indexed marketId, address indexed liquidator, uint256 price, uint256 reward);
+    event Liquidated(
+        address indexed trader, bytes32 indexed marketId, address indexed liquidator, uint256 price, uint256 reward, uint256 solidarityRefund
+    );
     event LiquidityAdded(address indexed provider, uint256 amount, uint256 shares);
     event LiquidityRemoved(address indexed provider, uint256 amount, uint256 shares);
+    event FeeDistributed(uint256 toPool, uint256 toMembers, uint256 toSolidarity);
+    event MemberJoined(address indexed member);
+    event MemberLeft(address indexed member);
+    event DividendClaimed(address indexed member, uint256 amount);
     event ParamsUpdated();
 
     error MarketDisabled();
@@ -88,17 +119,39 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
     error NoPosition();
     error InvalidSize();
     error UtilizationExceeded();
+    error WhaleCapExceeded();
     error NotLiquidatable();
     error WouldBeLiquidatable();
     error InsufficientLiquidity();
     error ZeroAmount();
+    error NotMember();
+    error NonTransferable();
+    error InvalidParams();
 
-    constructor(IERC20 _usdc) ERC20("Perp Liquidity Pool", "PLP") Ownable(msg.sender) {
+    constructor(IERC20 _usdc) ERC20("People's Perps Collective", "PLP") Ownable(msg.sender) {
         usdc = _usdc;
+        _setParams(
+            Params({
+                feeRatesBps: [uint16(5), 10, 25, 50],
+                feeBrackets: [uint256(1_000e6), 10_000e6, 50_000e6],
+                maintenanceMarginBps: 100,
+                liquidatorRewardBps: 500,
+                maxUtilizationBps: 5_000,
+                maxProfitBps: 10_000,
+                minMargin: 10e6,
+                maxPriceAge: 1 days,
+                maxPositionSize: 25_000e6,
+                dividendShareBps: 3_000,
+                solidarityShareBps: 2_000,
+                solidarityRefundBps: 2_500,
+                solidarityMarginCap: 500e6,
+                minMemberDeposit: 100e6
+            })
+        );
     }
 
     // ---------------------------------------------------------------------
-    // Admin
+    // Governance (owner = the Council)
     // ---------------------------------------------------------------------
 
     function setMarket(bytes32 marketId, AggregatorV3Interface feed, uint32 maxLeverage, bool enabled) external onlyOwner {
@@ -112,24 +165,27 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         emit MarketSet(marketId, address(feed), maxLeverage, enabled);
     }
 
-    function setParams(
-        uint256 _feeBps,
-        uint256 _maintenanceMarginBps,
-        uint256 _liquidatorRewardBps,
-        uint256 _maxUtilizationBps,
-        uint256 _maxProfitBps,
-        uint256 _minMargin,
-        uint256 _maxPriceAge
-    ) external onlyOwner {
-        require(_feeBps <= 100 && _maintenanceMarginBps <= 1_000 && _liquidatorRewardBps <= 5_000, "bounds");
-        require(_maxUtilizationBps <= BPS && _maxProfitBps > 0 && _maxPriceAge > 0, "bounds");
-        feeBps = _feeBps;
-        maintenanceMarginBps = _maintenanceMarginBps;
-        liquidatorRewardBps = _liquidatorRewardBps;
-        maxUtilizationBps = _maxUtilizationBps;
-        maxProfitBps = _maxProfitBps;
-        minMargin = _minMargin;
-        maxPriceAge = _maxPriceAge;
+    function setParams(Params calldata p) external onlyOwner {
+        _setParams(p);
+    }
+
+    function getParams() external view returns (Params memory) {
+        return _params;
+    }
+
+    function _setParams(Params memory p) internal {
+        for (uint256 i = 0; i < 4; i++) {
+            if (p.feeRatesBps[i] > 200) revert InvalidParams(); // no bracket above 2%
+        }
+        if (p.feeBrackets[0] == 0 || p.feeBrackets[0] >= p.feeBrackets[1] || p.feeBrackets[1] >= p.feeBrackets[2]) {
+            revert InvalidParams();
+        }
+        if (
+            p.maintenanceMarginBps > 1_000 || p.liquidatorRewardBps > 5_000 || p.maxUtilizationBps > BPS || p.maxProfitBps == 0
+                || p.maxPriceAge == 0 || p.maxPositionSize == 0 || p.minMemberDeposit == 0
+                || uint256(p.dividendShareBps) + p.solidarityShareBps > BPS || p.solidarityRefundBps > BPS
+        ) revert InvalidParams();
+        _params = p;
         emit ParamsUpdated();
     }
 
@@ -138,7 +194,7 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
     // ---------------------------------------------------------------------
 
     /// @notice Open a position, or add to an existing one in the same direction.
-    /// @param margin USDC collateral to post. The opening fee is charged on top of this.
+    /// @param margin USDC collateral to post. The (progressive) opening fee is charged on top.
     /// @param leverage Multiplier applied to `margin` to get the added notional size.
     function increasePosition(bytes32 marketId, bool isLong, uint256 margin, uint256 leverage) external nonReentrant {
         Market storage m = _market(marketId);
@@ -152,14 +208,15 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         uint256 price = getPrice(marketId);
         uint256 sizeDelta = margin * leverage;
         uint256 unitsDelta = (sizeDelta * PRICE_PRECISION) / price;
-        uint256 fee = (sizeDelta * feeBps) / BPS;
+        uint256 fee = _tax(p.size + sizeDelta) - _tax(p.size);
 
         p.size += sizeDelta;
         p.margin += margin;
         p.units += unitsDelta;
         p.isLong = isLong;
 
-        if (p.margin < minMargin) revert MarginTooSmall();
+        if (p.size > _params.maxPositionSize) revert WhaleCapExceeded();
+        if (p.margin < _params.minMargin) revert MarginTooSmall();
         if (p.size > p.margin * m.maxLeverage) revert InvalidLeverage();
         if (_isLiquidatable(p, price)) revert WouldBeLiquidatable();
 
@@ -172,9 +229,9 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         }
 
         usdc.safeTransferFrom(msg.sender, address(this), margin + fee);
-        poolBalance += fee;
+        _distributeFee(fee);
 
-        if (totalOpenInterest() * BPS > poolValue() * maxUtilizationBps) revert UtilizationExceeded();
+        if (totalOpenInterest() * BPS > poolValue() * _params.maxUtilizationBps) revert UtilizationExceeded();
 
         emit PositionIncreased(msg.sender, marketId, isLong, sizeDelta, margin, price, fee);
     }
@@ -189,14 +246,13 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         uint256 price = getPrice(marketId);
         bool isLong = p.isLong;
 
-        // Portion of the position being closed.
         uint256 unitsDelta = sizeDelta == p.size ? p.units : (p.units * sizeDelta) / p.size;
         uint256 marginDelta = sizeDelta == p.size ? p.margin : (p.margin * sizeDelta) / p.size;
 
         int256 pnl = _pnl(isLong, sizeDelta, unitsDelta, price);
-        int256 maxProfit = int256((sizeDelta * maxProfitBps) / BPS);
+        int256 maxProfit = int256((sizeDelta * _params.maxProfitBps) / BPS);
         if (pnl > maxProfit) pnl = maxProfit;
-        uint256 fee = (sizeDelta * feeBps) / BPS;
+        uint256 fee = _tax(p.size) - _tax(p.size - sizeDelta);
 
         p.size -= sizeDelta;
         p.units -= unitsDelta;
@@ -204,19 +260,23 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         _removeOpenInterest(m, isLong, sizeDelta, unitsDelta);
 
         if (p.size > 0) {
-            if (p.margin < minMargin) revert MarginTooSmall();
+            if (p.margin < _params.minMargin) revert MarginTooSmall();
             if (_isLiquidatable(p, price)) revert WouldBeLiquidatable();
         } else {
             delete positions[msg.sender][marketId];
         }
 
-        // Trader receives margin + pnl - fee, floored at zero. The pool absorbs the difference.
-        int256 owed = int256(marginDelta) + pnl - int256(fee);
-        uint256 payout = _settleWithPool(marginDelta, owed > 0 ? uint256(owed) : 0);
+        // Trader is owed margin + pnl - fee, floored at zero. The fee is only collected out of
+        // what the trader has left; the pool absorbs the rest of any difference.
+        int256 beforeFee = int256(marginDelta) + pnl;
+        uint256 feeCollected = beforeFee <= 0 ? 0 : (uint256(beforeFee) < fee ? uint256(beforeFee) : fee);
+        uint256 owed = beforeFee > 0 ? uint256(beforeFee) - feeCollected : 0;
+        uint256 payout;
+        (payout, feeCollected) = _settleWithPool(marginDelta, owed, feeCollected);
 
         if (payout > 0) usdc.safeTransfer(msg.sender, payout);
 
-        emit PositionDecreased(msg.sender, marketId, isLong, sizeDelta, pnl, price, fee, payout);
+        emit PositionDecreased(msg.sender, marketId, isLong, sizeDelta, pnl, price, feeCollected, payout);
     }
 
     /// @notice Post extra collateral to an open position, lowering its leverage and liquidation risk.
@@ -231,6 +291,7 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
     }
 
     /// @notice Liquidate an underwater position. Anyone can call; the caller earns a reward.
+    /// Small traders get part of their margin back from the solidarity fund.
     function liquidate(address trader, bytes32 marketId) external nonReentrant {
         Market storage m = _market(marketId);
         Position memory p = positions[trader][marketId];
@@ -242,15 +303,23 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         delete positions[trader][marketId];
         _removeOpenInterest(m, p.isLong, p.size, p.units);
 
-        uint256 reward = (p.margin * liquidatorRewardBps) / BPS;
+        uint256 reward = (p.margin * _params.liquidatorRewardBps) / BPS;
         poolBalance += p.margin - reward;
-        usdc.safeTransfer(msg.sender, reward);
 
-        emit Liquidated(trader, marketId, msg.sender, price, reward);
+        uint256 refund;
+        if (p.margin <= _params.solidarityMarginCap) {
+            refund = _min((p.margin * _params.solidarityRefundBps) / BPS, solidarityFund);
+            solidarityFund -= refund;
+        }
+
+        usdc.safeTransfer(msg.sender, reward);
+        if (refund > 0) usdc.safeTransfer(trader, refund);
+
+        emit Liquidated(trader, marketId, msg.sender, price, reward, refund);
     }
 
     // ---------------------------------------------------------------------
-    // Liquidity
+    // The Collective (liquidity + membership)
     // ---------------------------------------------------------------------
 
     function addLiquidity(uint256 amount) external nonReentrant returns (uint256 shares) {
@@ -260,18 +329,41 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         usdc.safeTransferFrom(msg.sender, address(this), amount);
         poolBalance += amount;
         _mint(msg.sender, shares);
+        _syncMembership(msg.sender);
         emit LiquidityAdded(msg.sender, amount, shares);
     }
 
     function removeLiquidity(uint256 shares) external nonReentrant returns (uint256 amount) {
         if (shares == 0) revert ZeroAmount();
-        amount = (shares * (poolValue() + VIRTUAL_ASSETS)) / (totalSupply() + VIRTUAL_SHARES);
+        amount = sharesToUsdc(shares);
         if (amount > poolBalance) revert InsufficientLiquidity();
         _burn(msg.sender, shares);
         poolBalance -= amount;
-        if (totalOpenInterest() * BPS > poolValue() * maxUtilizationBps) revert UtilizationExceeded();
+        if (totalOpenInterest() * BPS > poolValue() * _params.maxUtilizationBps) revert UtilizationExceeded();
+        _syncMembership(msg.sender);
         usdc.safeTransfer(msg.sender, amount);
         emit LiquidityRemoved(msg.sender, amount, shares);
+    }
+
+    /// @notice Claim your equal share of fee dividends.
+    function claimDividend() external nonReentrant returns (uint256 amount) {
+        if (memberSince[msg.sender] == 0) revert NotMember();
+        amount = _claimDividend(msg.sender);
+    }
+
+    function isMember(address account) external view returns (bool) {
+        return memberSince[account] != 0;
+    }
+
+    function pendingDividend(address account) public view returns (uint256) {
+        if (memberSince[account] == 0) return 0;
+        return (accDividendPerMember - _dividendDebt[account]) / ACC_PRECISION;
+    }
+
+    /// @dev Membership shares can't be traded: only minted by deposits and burned by withdrawals.
+    function _update(address from, address to, uint256 value) internal override {
+        if (from != address(0) && to != address(0)) revert NonTransferable();
+        super._update(from, to, value);
     }
 
     // ---------------------------------------------------------------------
@@ -283,7 +375,7 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         Market storage m = _market(marketId);
         (, int256 answer,, uint256 updatedAt,) = m.feed.latestRoundData();
         if (answer <= 0) revert InvalidPrice();
-        if (block.timestamp - updatedAt > maxPriceAge) revert StalePrice();
+        if (block.timestamp - updatedAt > _params.maxPriceAge) revert StalePrice();
         return uint256(answer) * 10 ** (18 - m.feedDecimals);
     }
 
@@ -291,6 +383,10 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
     function poolValue() public view returns (uint256) {
         int256 value = int256(poolBalance) - totalTraderPnl();
         return value > 0 ? uint256(value) : 0;
+    }
+
+    function sharesToUsdc(uint256 shares) public view returns (uint256) {
+        return (shares * (poolValue() + VIRTUAL_ASSETS)) / (totalSupply() + VIRTUAL_SHARES);
     }
 
     /// @notice Aggregate unrealized PnL of every open position across all markets.
@@ -313,6 +409,12 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
 
     function marketCount() external view returns (uint256) {
         return marketIds.length;
+    }
+
+    /// @notice The progressive fee `trader` would pay to add `sizeDelta` to their position.
+    function openingFee(address trader, bytes32 marketId, uint256 sizeDelta) external view returns (uint256) {
+        uint256 size = positions[trader][marketId].size;
+        return _tax(size + sizeDelta) - _tax(size);
     }
 
     /// @notice Everything a UI needs about one position.
@@ -350,6 +452,58 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         if (address(m.feed) == address(0)) revert UnknownMarket();
     }
 
+    /// @dev Cumulative progressive fee on a total position size, bracket by bracket.
+    function _tax(uint256 size) internal view returns (uint256 total) {
+        uint256 lower;
+        for (uint256 i = 0; i < 4 && size > lower; i++) {
+            uint256 upper = i < 3 ? _params.feeBrackets[i] : type(uint256).max;
+            uint256 slice = (size < upper ? size : upper) - lower;
+            total += (slice * _params.feeRatesBps[i]) / BPS;
+            lower = upper;
+        }
+    }
+
+    /// @dev Splits a fee between the capital pool, equal member dividends and the solidarity fund.
+    function _distributeFee(uint256 fee) internal {
+        if (fee == 0) return;
+        uint256 toSolidarity = (fee * _params.solidarityShareBps) / BPS;
+        uint256 toMembers = memberCount > 0 ? (fee * _params.dividendShareBps) / BPS : 0;
+        uint256 toPool = fee - toSolidarity - toMembers;
+
+        solidarityFund += toSolidarity;
+        if (toMembers > 0) {
+            accDividendPerMember += (toMembers * ACC_PRECISION) / memberCount;
+            dividendReserve += toMembers;
+        }
+        poolBalance += toPool;
+        emit FeeDistributed(toPool, toMembers, toSolidarity);
+    }
+
+    function _syncMembership(address account) internal {
+        bool qualifies = sharesToUsdc(balanceOf(account)) >= _params.minMemberDeposit;
+        bool member = memberSince[account] != 0;
+        if (qualifies && !member) {
+            memberSince[account] = block.timestamp;
+            _dividendDebt[account] = accDividendPerMember;
+            memberCount++;
+            emit MemberJoined(account);
+        } else if (!qualifies && member) {
+            _claimDividend(account);
+            memberSince[account] = 0;
+            memberCount--;
+            emit MemberLeft(account);
+        }
+    }
+
+    function _claimDividend(address account) internal returns (uint256 amount) {
+        amount = pendingDividend(account);
+        _dividendDebt[account] = accDividendPerMember;
+        if (amount == 0) return 0;
+        dividendReserve -= amount;
+        usdc.safeTransfer(account, amount);
+        emit DividendClaimed(account, amount);
+    }
+
     function _pnl(bool isLong, uint256 size, uint256 units, uint256 price) internal pure returns (int256) {
         int256 value = int256((units * price) / PRICE_PRECISION);
         return isLong ? value - int256(size) : int256(size) - value;
@@ -357,12 +511,12 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
 
     function _isLiquidatable(Position memory p, uint256 price) internal view returns (bool) {
         int256 equity = int256(p.margin) + _pnl(p.isLong, p.size, p.units, price);
-        return equity < int256((p.size * maintenanceMarginBps) / BPS);
+        return equity < int256((p.size * _params.maintenanceMarginBps) / BPS);
     }
 
     /// @dev Price at which equity equals the maintenance margin. Zero if the long can't be liquidated.
     function _liquidationPrice(Position memory p) internal view returns (uint256) {
-        uint256 maintenance = (p.size * maintenanceMarginBps) / BPS;
+        uint256 maintenance = (p.size * _params.maintenanceMarginBps) / BPS;
         if (p.isLong) {
             // margin + units*P - size = maintenance  =>  P = (size + maintenance - margin) / units
             if (p.size + maintenance <= p.margin) return 0;
@@ -382,12 +536,19 @@ contract PerpExchange is ERC20, Ownable, ReentrancyGuard {
         }
     }
 
-    /// @dev Moves released margin into the pool and pays the trader out of it.
-    /// If the pool can't cover a winning trade in full, the payout is capped at what it holds.
-    function _settleWithPool(uint256 marginReleased, uint256 payout) internal returns (uint256) {
+    /// @dev Settles a close: the released margin joins the pool, then the pool pays the trader
+    /// and hands the fee out for distribution. Anything the pool can't cover in full is capped
+    /// at what it holds.
+    function _settleWithPool(uint256 marginReleased, uint256 payout, uint256 fee) internal returns (uint256, uint256) {
         uint256 available = poolBalance + marginReleased;
-        if (payout > available) payout = available;
-        poolBalance = available - payout;
-        return payout;
+        fee = _min(fee, available);
+        payout = _min(payout, available - fee);
+        poolBalance = available - payout - fee;
+        _distributeFee(fee);
+        return (payout, fee);
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
     }
 }
