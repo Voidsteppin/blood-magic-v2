@@ -1,0 +1,63 @@
+const fs = require("fs");
+const path = require("path");
+const { ethers, network } = require("hardhat");
+
+// Chainlink ETH/USD on Arbitrum Sepolia (verified on-chain: "ETH / USD", 8 decimals)
+const CHAINLINK_ETH_USD = {
+  arbitrumSepolia: "0xd30e2101a97dcbAeBCBC04F14C3f624E67A35165",
+};
+const ETH_USD = ethers.encodeBytes32String("ETH-USD");
+const SEED_LIQUIDITY = ethers.parseUnits("100000", 6);
+
+async function main() {
+  const [deployer] = await ethers.getSigners();
+  if (!deployer) throw new Error("No deployer account. Set PRIVATE_KEY in contracts/.env");
+  console.log(`Deploying to ${network.name} from ${deployer.address}`);
+
+  const usdc = await ethers.deployContract("MockUSDC");
+  await usdc.waitForDeployment();
+  console.log("MockUSDC:", await usdc.getAddress());
+
+  let feedAddress = CHAINLINK_ETH_USD[network.name];
+  if (!feedAddress) {
+    const feed = await ethers.deployContract("MockAggregator", [8, 2700_00000000n]);
+    await feed.waitForDeployment();
+    feedAddress = await feed.getAddress();
+    console.log("MockAggregator (no Chainlink feed on this network):", feedAddress);
+  }
+
+  const exchange = await ethers.deployContract("PerpExchange", [await usdc.getAddress()]);
+  await exchange.waitForDeployment();
+  const exchangeAddress = await exchange.getAddress();
+  console.log("PerpExchange:", exchangeAddress);
+
+  await (await exchange.setMarket(ETH_USD, feedAddress, 50, true)).wait();
+  console.log("Added ETH-USD market (max 50x)");
+
+  await (await usdc.mint(deployer.address, SEED_LIQUIDITY)).wait();
+  await (await usdc.approve(exchangeAddress, SEED_LIQUIDITY)).wait();
+  await (await exchange.addLiquidity(SEED_LIQUIDITY)).wait();
+  console.log("Seeded pool with 100,000 test USDC");
+
+  if (network.name === "hardhat") {
+    console.log("In-memory dry run: not writing web/src/deployments.json");
+    return;
+  }
+
+  const out = {
+    chainId: Number(network.config.chainId ?? (await ethers.provider.getNetwork()).chainId),
+    network: network.name,
+    usdc: await usdc.getAddress(),
+    exchange: exchangeAddress,
+    markets: [{ id: "ETH-USD", feed: feedAddress }],
+  };
+  const file = path.join(__dirname, "..", "..", "web", "src", "deployments.json");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(out, null, 2) + "\n");
+  console.log(`Wrote ${path.relative(process.cwd(), file)}`);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});

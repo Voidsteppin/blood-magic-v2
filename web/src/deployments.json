@@ -1,0 +1,7 @@
+{
+  "chainId": 421614,
+  "network": "arbitrumSepolia",
+  "usdc": null,
+  "exchange": null,
+  "markets": [{ "id": "ETH-USD", "feed": "0xd30e2101a97dcbAeBCBC04F14C3f624E67A35165" }]
+}
