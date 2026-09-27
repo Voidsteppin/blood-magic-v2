@@ -17,6 +17,12 @@ const FEED_ABI = ["function latestRoundData() view returns (uint80, int256, uint
 const POLL_MS = 5000;
 const MAX_LEVERAGE = 50;
 const PROPOSALS_SHOWN = 8;
+// Contract defaults, used for previews before the contracts are reachable.
+const DEFAULT_FEES = {
+  feeRatesBps: [5, 10, 25, 50],
+  feeBrackets: [1_000_000000n, 10_000_000000n, 50_000_000000n],
+  maxPositionSize: 25_000_000000n,
+};
 
 // ---------- formatting ----------
 const n = (v, d = 2) => Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -237,6 +243,10 @@ export default function App() {
 
   return (
     <div className="app">
+      <div className="backdrop" aria-hidden="true">
+        <div className="sun" />
+        <div className="floor" />
+      </div>
       <header className="topbar">
         <div className="brand">
           <span className="logo" aria-hidden="true">★</span>
@@ -267,8 +277,7 @@ export default function App() {
       {walletError && <div className="notice err">{walletError}</div>}
       {!isDeployed && (
         <div className="notice">
-          The Commune hasn't launched yet. Run <code>npx hardhat run scripts/deploy.js --network arbitrumSepolia</code> in{" "}
-          <code>contracts</code>. Live prices still show below.
+          ★ Launching soon on Arbitrum Sepolia. Trading opens when the contracts go live. Live ETH prices below are real.
         </div>
       )}
 
@@ -341,7 +350,7 @@ function TradePanel({ data, ready, tx, account }) {
 
   const maxLev = data?.maxLeverage ?? MAX_LEVERAGE;
   const price = data?.price ?? 0;
-  const params = data?.params;
+  const params = data?.params ?? DEFAULT_FEES;
   const existing = data?.position;
   const m = Number(margin) || 0;
   const size = m * leverage;
