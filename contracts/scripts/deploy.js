@@ -11,6 +11,16 @@ const SEED_LIQUIDITY = ethers.parseUnits("100000", 6);
 const VOTING_PERIOD = 60 * 60; // 1 hour, short so testnet votes are quick to try
 const QUORUM_BPS = 2_000; // 20% of members must vote
 
+// Live ETH-USD from Coinbase (8 decimals), falling back to $2,700 offline
+async function startingPrice() {
+  try {
+    const { price } = await (await fetch("https://api.exchange.coinbase.com/products/ETH-USD/ticker")).json();
+    return ethers.parseUnits(Number(price).toFixed(8), 8);
+  } catch {
+    return 2700_00000000n;
+  }
+}
+
 async function main() {
   const [deployer] = await ethers.getSigners();
   if (!deployer) throw new Error("No deployer account. Set PRIVATE_KEY in contracts/.env");
@@ -22,10 +32,11 @@ async function main() {
 
   let feedAddress = CHAINLINK_ETH_USD[network.name];
   if (!feedAddress) {
-    const feed = await ethers.deployContract("MockAggregator", [8, 2700_00000000n]);
+    // Local chain (including an Anvil fork): a settable feed, kept live by scripts/price-relay.js
+    const feed = await ethers.deployContract("MockAggregator", [8, await startingPrice()]);
     await feed.waitForDeployment();
     feedAddress = await feed.getAddress();
-    console.log("MockAggregator (no Chainlink feed on this network):", feedAddress);
+    console.log("MockAggregator (run scripts/price-relay.js for live prices):", feedAddress);
   }
 
   const exchange = await ethers.deployContract("PerpExchange", [await usdc.getAddress()]);
@@ -60,7 +71,9 @@ async function main() {
     council: councilAddress,
     markets: [{ id: "ETH-USD", feed: feedAddress }],
   };
-  const file = path.join(__dirname, "..", "..", "web", "src", "deployments.json");
+  // Local deploys go to a gitignored file so they never overwrite the published testnet addresses
+  const name = network.name === "localhost" ? "deployments.local.json" : "deployments.json";
+  const file = path.join(__dirname, "..", "..", "web", "src", name);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(out, null, 2) + "\n");
   console.log(`Wrote ${path.relative(process.cwd(), file)}`);

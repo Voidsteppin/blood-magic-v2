@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { BrowserProvider, Contract, MaxUint256, formatUnits, parseUnits } from "ethers";
 import {
   MARKET,
@@ -12,6 +12,7 @@ import {
   readProvider,
   toParams,
 } from "./chain.js";
+import PriceChart from "./PriceChart.jsx";
 
 const FEED_ABI = ["function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)", "function decimals() view returns (uint8)"];
 const POLL_MS = 5000;
@@ -244,14 +245,16 @@ export default function App() {
   return (
     <div className="app">
       <div className="backdrop" aria-hidden="true">
-        <div className="sun" />
-        <div className="floor" />
+        <div className="moon" />
+        <div className="mist" />
+        <Web side="left" spider />
+        <Web side="right" />
       </div>
       <header className="topbar">
         <div className="brand">
-          <span className="logo" aria-hidden="true">★</span>
+          <span className="logo" aria-hidden="true"><span>☾</span></span>
           <div>
-            <div className="name">People's Perps</div>
+            <div className="name">Blood Magic<span className="ver">v2</span></div>
             <div className="slogan">Leverage for the many, not the few</div>
           </div>
           <span className="badge">{chain?.name ?? "Unknown network"}</span>
@@ -282,6 +285,7 @@ export default function App() {
       )}
 
       <MarketBar data={data} />
+      <PriceChart price={data?.price} position={wallet.account ? data?.position : null} />
 
       <main className="grid">
         <div className="col">
@@ -317,6 +321,69 @@ export default function App() {
   );
 }
 
+// Corner spiderweb: threads fan out from the corner, joined by sagging rings.
+const WEB_ANGLES = [0, 15, 30, 45, 60, 75, 90].map((d) => (d * Math.PI) / 180);
+const WEB_RINGS = [40, 80, 125, 175, 230, 290];
+const webPoint = (r, a) => [r * Math.cos(a), r * Math.sin(a)];
+const WEB_PATH = [
+  ...WEB_ANGLES.map((a) => `M0 0 L${webPoint(330, a).join(" ")}`),
+  ...WEB_RINGS.flatMap((r) =>
+    WEB_ANGLES.slice(1).map((a, i) => {
+      const [x1, y1] = webPoint(r, WEB_ANGLES[i]);
+      const [x2, y2] = webPoint(r, a);
+      const [cx, cy] = webPoint(r * 0.86, (a + WEB_ANGLES[i]) / 2);
+      return `M${x1} ${y1} Q${cx} ${cy} ${x2} ${y2}`;
+    })
+  ),
+].join(" ");
+
+function Web({ side, spider }) {
+  return (
+    <svg className={`web ${side}`} viewBox="0 0 320 320">
+      <path d={WEB_PATH} />
+      {spider && (
+        <g className="spider">
+          <line x1="140" y1="-140" x2="140" y2="118" />
+          <ellipse cx="140" cy="126" rx="6" ry="8" />
+          <circle cx="140" cy="115" r="4" />
+          <path d="M134 120 l-10 -8 M134 125 l-12 0 M134 130 l-10 8 M146 120 l10 -8 M146 125 l12 0 M146 130 l10 8" stroke="rgba(236, 228, 218, 0.5)" />
+        </g>
+      )}
+    </svg>
+  );
+}
+
+// Candle flames follow the last minute of price action: green rising, blood red falling, violet when flat.
+const MOMENTUM_WINDOW_MS = 60_000;
+const FLAT_PCT = 0.01;
+function Candles({ price }) {
+  const history = useRef([]);
+  const [move, setMove] = useState(0);
+
+  useEffect(() => {
+    if (!price) return;
+    const now = Date.now();
+    history.current = [...history.current.filter((h) => now - h.t <= MOMENTUM_WINDOW_MS), { t: now, price }];
+    const first = history.current[0].price;
+    setMove(((price - first) / first) * 100);
+  }, [price]);
+
+  const mood = move > FLAT_PCT ? "rising" : move < -FLAT_PCT ? "falling" : "still";
+  // 0.1% in a minute is a big move for ETH; flames grow up to 1.8x
+  const size = 1 + Math.min(Math.abs(move) / 0.1, 1) * 0.8;
+  const label = mood === "still" ? "Price steady over the last minute" : `Price ${mood} ${n(Math.abs(move), 3)}% over the last minute`;
+
+  return (
+    <div className={`candles ${mood}`} style={{ "--size": size }} role="img" aria-label={label} title={label}>
+      {[46, 64, 38].map((h, i) => (
+        <span key={i} className="candle" style={{ "--h": `${h}px`, "--delay": `${i * -0.37}s` }}>
+          <span className="flame" />
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function MarketBar({ data }) {
   const age = data?.priceAge ?? null;
   return (
@@ -325,6 +392,7 @@ function MarketBar({ data }) {
         <div className="market-name">{MARKET}</div>
         <div className="price">{data?.price ? usd(data.price) : "—"}</div>
       </div>
+      <Candles price={data?.price} />
       <Stat label="Oracle update" value={age === null ? "—" : age < 120 ? `${age}s ago` : `${Math.round(age / 60)}m ago`} />
       <Stat label="Longs / shorts" value={`${usd(data?.longOI ?? 0, 0)} / ${usd(data?.shortOI ?? 0, 0)}`} />
       <Stat label="Members" value={data?.memberCount ?? "—"} />

@@ -5,12 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:anvil": "vite --mode anvil",
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview"
   },
   "dependencies": {
     "ethers": "^6.17.0",
+    "lightweight-charts": "^5.2.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

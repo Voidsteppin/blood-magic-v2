@@ -1,11 +1,13 @@
-# People's Perps
+# Blood Magic v2
 
 *Leverage for the many, not the few.*
+
+**Live testnet site:** https://voidsteppin.github.io/blood-magic-v2/
 
 A perpetual futures exchange run as a cooperative, on the **Arbitrum Sepolia testnet**. Trade **ETH-USD** long or short with **1–50x leverage**, using USDC as collateral and Chainlink prices. Unlike a normal perps DEX, the rules push value toward small traders and small depositors, and nobody owns it: members govern it by vote.
 
 ```
-perps-dex/
+blood-magic-v2/
 ├── contracts/   Solidity + Hardhat (exchange, Council, tests, deploy script)
 └── web/         React + Vite app (ethers v6)
 ```
@@ -47,6 +49,7 @@ npx hardhat test
    npx hardhat run scripts/deploy.js --network arbitrumSepolia
    ```
    This deploys test USDC and the exchange, adds ETH-USD, seeds the Collective with 100,000 test USDC (so the deployer is its first member), deploys the Council, and hands it ownership. Addresses are written to `web/src/deployments.json`.
+4. Commit and push `web/src/deployments.json`. The GitHub Pages workflow rebuilds the live site with the new addresses.
 
 ## 3. Run the web app
 
@@ -56,11 +59,20 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173, connect MetaMask, switch to Arbitrum Sepolia, and click **Get 10,000 test USDC**. To publish the site, run `npm run build` and upload `web/dist/` to a static host (Vercel, Netlify, Cloudflare Pages).
+Open http://localhost:5173, connect MetaMask, switch to Arbitrum Sepolia, and click **Get 10,000 test USDC**. Every push to `main` that touches `web/` rebuilds and publishes the site to GitHub Pages (`.github/workflows/pages.yml`).
 
-### Local-only mode
+### Paper trading on an Anvil fork (live prices)
 
-`npx hardhat node` in one terminal, then `npx hardhat run scripts/deploy.js --network localhost`. This uses a mock $2,700 price feed. Add chain 31337 at http://127.0.0.1:8545 to MetaMask and import a test key printed by `hardhat node`.
+Needs [Foundry](https://getfoundry.sh). Run each in its own terminal:
+
+```
+anvil --fork-url https://sepolia-rollup.arbitrum.io/rpc --chain-id 31337
+cd contracts && npx hardhat run scripts/deploy.js --network localhost
+cd contracts && node scripts/price-relay.js
+cd web && npm run dev:anvil
+```
+
+The local deploy uses a settable price feed and writes its addresses to `web/src/deployments.local.json` (gitignored), so it never touches the published testnet addresses. `price-relay.js` pushes the live Coinbase ETH-USD price into that feed every 3 seconds. Add chain 31337 at http://127.0.0.1:8545 to MetaMask and import an Anvil test account, or fund your own with `cast rpc anvil_setBalance <address> 0x56BC75E2D63100000`. The fork resets when Anvil stops.
 
 ## Before real money
 

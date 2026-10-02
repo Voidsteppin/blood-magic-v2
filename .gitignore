@@ -6,3 +6,4 @@ contracts/typechain-types/
 contracts/coverage/
 web/dist/
 *.log
+web/src/deployments.local.json

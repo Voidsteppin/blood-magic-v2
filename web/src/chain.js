@@ -1,7 +1,9 @@
 import { Contract, Interface, JsonRpcProvider, encodeBytes32String } from "ethers";
-import deployments from "./deployments.json";
+import published from "./deployments.json";
 
-export { deployments };
+// `npm run dev:anvil` uses the addresses from a local Anvil deploy (deployments.local.json, gitignored)
+const local = Object.values(import.meta.glob("./deployments.local.json", { eager: true, import: "default" }))[0];
+export const deployments = import.meta.env.MODE === "anvil" && local ? local : published;
 
 export const CHAINS = {
   421614: {
