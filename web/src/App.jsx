@@ -249,8 +249,6 @@ export default function App() {
         <div className="moon" />
         <GothicScene />
         <div className="mist" />
-        <Web side="left" spider />
-        <Web side="right" />
       </div>
       <header className="topbar">
         <div className="brand">
@@ -320,38 +318,6 @@ export default function App() {
         )}
       </footer>
     </div>
-  );
-}
-
-// Corner spiderweb: threads fan out from the corner, joined by sagging rings.
-const WEB_ANGLES = [0, 15, 30, 45, 60, 75, 90].map((d) => (d * Math.PI) / 180);
-const WEB_RINGS = [40, 80, 125, 175, 230, 290];
-const webPoint = (r, a) => [r * Math.cos(a), r * Math.sin(a)];
-const WEB_PATH = [
-  ...WEB_ANGLES.map((a) => `M0 0 L${webPoint(330, a).join(" ")}`),
-  ...WEB_RINGS.flatMap((r) =>
-    WEB_ANGLES.slice(1).map((a, i) => {
-      const [x1, y1] = webPoint(r, WEB_ANGLES[i]);
-      const [x2, y2] = webPoint(r, a);
-      const [cx, cy] = webPoint(r * 0.86, (a + WEB_ANGLES[i]) / 2);
-      return `M${x1} ${y1} Q${cx} ${cy} ${x2} ${y2}`;
-    })
-  ),
-].join(" ");
-
-function Web({ side, spider }) {
-  return (
-    <svg className={`web ${side}`} viewBox="0 0 320 320">
-      <path d={WEB_PATH} />
-      {spider && (
-        <g className="spider">
-          <line x1="140" y1="-140" x2="140" y2="118" />
-          <ellipse cx="140" cy="126" rx="6" ry="8" />
-          <circle cx="140" cy="115" r="4" />
-          <path d="M134 120 l-10 -8 M134 125 l-12 0 M134 130 l-10 8 M146 120 l10 -8 M146 125 l12 0 M146 130 l10 8" stroke="rgba(236, 228, 218, 0.5)" />
-        </g>
-      )}
-    </svg>
   );
 }
 
