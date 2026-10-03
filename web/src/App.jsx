@@ -12,6 +12,7 @@ import {
   readProvider,
   toParams,
 } from "./chain.js";
+import GothicScene from "./GothicScene.jsx";
 import PriceChart from "./PriceChart.jsx";
 
 const FEED_ABI = ["function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)", "function decimals() view returns (uint8)"];
@@ -246,6 +247,7 @@ export default function App() {
     <div className="app">
       <div className="backdrop" aria-hidden="true">
         <div className="moon" />
+        <GothicScene />
         <div className="mist" />
         <Web side="left" spider />
         <Web side="right" />
