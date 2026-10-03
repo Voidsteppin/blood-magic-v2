@@ -54,19 +54,13 @@ code { background: var(--panel-2); padding: 1px 6px; border: 1px solid var(--bor
 .moon {
   position: absolute;
   right: 8vw;
-  top: 9vh;
-  width: min(34vw, 300px);
+  top: 8vh;
+  width: min(32vw, 280px);
   aspect-ratio: 1;
-  border-radius: 50%;
-  background:
-    radial-gradient(circle at 34% 30%, rgba(60, 50, 70, 0.35) 0 9%, transparent 11%),
-    radial-gradient(circle at 62% 58%, rgba(60, 50, 70, 0.3) 0 13%, transparent 15%),
-    radial-gradient(circle at 46% 78%, rgba(60, 50, 70, 0.25) 0 6%, transparent 8%),
-    radial-gradient(circle at 42% 38%, #f4efe9 0%, #c9c2cf 55%, #6f6878 100%);
-  box-shadow: 0 0 40px rgba(220, 210, 235, 0.35), 0 0 140px rgba(165, 148, 255, 0.18);
-  filter: blur(1.5px);
-  opacity: 0.55;
+  opacity: 0.88;
+  filter: drop-shadow(0 0 18px rgba(236, 232, 245, 0.3)) drop-shadow(0 0 80px rgba(165, 148, 255, 0.16));
 }
+.moon svg { display: block; width: 100%; height: 100%; }
 .mist {
   position: absolute;
   left: -20%;
