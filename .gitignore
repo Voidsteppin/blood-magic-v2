@@ -7,3 +7,4 @@ contracts/coverage/
 web/dist/
 *.log
 web/src/deployments.local.json
+protocol/deployments/31337.json
